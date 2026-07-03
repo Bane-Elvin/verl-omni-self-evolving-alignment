@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
@@ -456,6 +457,35 @@ class PositionEmbedding(nn.Module):
 # ===================================================================
 
 
+@contextmanager
+def _default_floating_dtype(dtype: torch.dtype):
+    previous = torch.get_default_dtype()
+    if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def _update_config_from_checkpoint_metadata(config: BagelTrainingConfig, ckpt_path: str) -> None:
+    from safetensors import safe_open
+
+    with safe_open(ckpt_path, framework="pt", device="cpu") as checkpoint:
+        if "latent_pos_embed.pos_embed" not in checkpoint.keys():
+            return
+        actual_len = checkpoint.get_slice("latent_pos_embed.pos_embed").get_shape()[0]
+    grid = int(actual_len**0.5)
+    if grid * grid == actual_len and grid != config.max_latent_size:
+        config.max_latent_size = grid
+
+
+def _should_load_pretrained_weights() -> bool:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
 class BagelForTraining(NonDiffusersModelBase):
     """Standalone Bagel MoT module for FlowGRPO FSDP training.
 
@@ -609,23 +639,24 @@ class BagelForTraining(NonDiffusersModelBase):
         """
         config = BagelTrainingConfig.from_model_path(model_path)
         ckpt_path = os.path.join(model_path, "ema.safetensors")
+        _update_config_from_checkpoint_metadata(config, ckpt_path)
+
+        with _default_floating_dtype(torch_dtype):
+            model = cls(config)
+
+        if not _should_load_pretrained_weights():
+            return model.to(torch_dtype)
+
         from safetensors.torch import load_file
 
         state_dict = load_file(ckpt_path)
-
-        if "latent_pos_embed.pos_embed" in state_dict:
-            actual_len = state_dict["latent_pos_embed.pos_embed"].shape[0]
-            grid = int(actual_len**0.5)
-            if grid * grid == actual_len and grid != config.max_latent_size:
-                config.max_latent_size = grid
-
-        model = cls(config)
         mapped = _map_checkpoint_to_training(state_dict, config)
         missing, unexpected = model.load_state_dict(mapped, strict=False)
         if missing:
             import logging
 
             logging.getLogger(__name__).warning(f"Missing keys when loading BagelForTraining: {len(missing)} keys")
+        del state_dict, mapped
 
         model = model.to(torch_dtype)
         return model

@@ -11,6 +11,6 @@ stages:
     enforce_eager: true                  # required: no CUDA graphs for diffusion
     trust_remote_code: true              # BAGEL uses custom Qwen2-MoT code
     enable_prefix_caching: false         # single-request, no cache needed
-    devices: "0"                         # GPU device index
+    devices: "0,1,2,3"                   # GPU device indices used by rollout TP=4
     default_sampling_params:
       seed: 52                           # overridden per-request in FlowGRPO
