@@ -33,8 +33,9 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.configuration_utils import PretrainedConfig
 
-
-DEFAULT_GRM_PROMPT = "Please output only the text content from the image without any additional descriptions or formatting."
+DEFAULT_GRM_PROMPT = (
+    "Please output only the text content from the image without any additional descriptions or formatting."
+)
 
 
 @dataclass
@@ -410,9 +411,9 @@ def pil_to_data_url(image: Image.Image) -> str:
 
 
 def levenshtein_score(text: str, ground_truth: str) -> float:
-    import Levenshtein  # noqa: PLC0415
-
     import re
+
+    import Levenshtein  # noqa: PLC0415
 
     gt = re.sub(r"\s+", "", ground_truth).lower()
     pred = re.sub(r"\s+", "", text).lower()
@@ -958,6 +959,7 @@ def update_actor(
             rollout_batch.tokens,
             rollout_batch.old_logprobs,
             rollout_batch.advantages_per_gpu,
+            strict=True,
         )
         for row, tokens, old_logprobs, adv in local_items:
             tokens = tokens.to(device)
@@ -1000,9 +1002,7 @@ def update_actor(
                 ratio_values.append(ratio_float.mean() * micro_token_count)
                 ratio_std_values.append(ratio_float.std(unbiased=False) * micro_token_count)
                 clip_values.append((torch.abs(ratio_float - 1.0) > args.clip_ratio).float().mean() * micro_token_count)
-                clip_high_values.append(
-                    (ratio_float > 1.0 + args.clip_ratio).float().mean() * micro_token_count
-                )
+                clip_high_values.append((ratio_float > 1.0 + args.clip_ratio).float().mean() * micro_token_count)
                 clip_low_values.append((ratio_float < 1.0 - args.clip_ratio).float().mean() * micro_token_count)
 
     return ActorUpdateStats(
@@ -1270,7 +1270,9 @@ def compute_training_metrics(
     return metrics
 
 
-def log_training_step(run, metrics: dict[str, float], step: int, args: argparse.Namespace, state: DistributedState) -> None:
+def log_training_step(
+    run, metrics: dict[str, float], step: int, args: argparse.Namespace, state: DistributedState
+) -> None:
     if run is not None:
         run.log(metrics, step=step)
     if is_main_process(state) and step % args.log_every == 0:
