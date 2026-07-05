@@ -27,9 +27,10 @@ REWARD_SERVER_PORT=${REWARD_SERVER_PORT:-8000}
 REWARD_URL=${REWARD_URL:-http://$REWARD_SERVER_HOST:$REWARD_SERVER_PORT/v1/chat/completions}
 REWARD_SERVER_CUDA_VISIBLE_DEVICES=${REWARD_SERVER_CUDA_VISIBLE_DEVICES:-0,1,2,3}
 REWARD_SERVER_TP=${REWARD_SERVER_TP:-4}
-REWARD_SERVER_GPU_MEMORY_UTILIZATION=${REWARD_SERVER_GPU_MEMORY_UTILIZATION:-0.25}
+REWARD_SERVER_GPU_MEMORY_UTILIZATION=${REWARD_SERVER_GPU_MEMORY_UTILIZATION:-0.20}
 REWARD_SERVER_MAX_MODEL_LEN=${REWARD_SERVER_MAX_MODEL_LEN:-8192}
 REWARD_SERVER_LOG=${REWARD_SERVER_LOG:-$REPO_ROOT/outputs/janus_ocr_grpo/${SWEEP_TAG}_reward_server.log}
+SWEEP_SPECS=${SWEEP_SPECS:-$'1 16 172\n1 8 172\n1 4 172\n2 8 86\n2 4 86\n4 4 43'}
 
 select_gpus() {
     local count=$1
@@ -95,15 +96,10 @@ if [[ "$AUTO_START_REWARD_SERVER" == "1" && "${REWARD_MODE:-openai_ocr}" == "ope
     wait_reward_server
 fi
 
-for spec in \
-    "1 16 172" \
-    "1 8 172" \
-    "1 4 172" \
-    "2 8 86" \
-    "2 4 86" \
-    "4 4 43"
-do
-    read -r train_bsz rollout_n steps <<< "$spec"
+while read -r train_bsz rollout_n steps; do
+    if [[ -z "${train_bsz:-}" || "$train_bsz" == \#* ]]; then
+        continue
+    fi
     run_name="${SWEEP_TAG}_b${train_bsz}_n${rollout_n}_s${steps}"
     train_gpus=$(select_gpus "$train_bsz" "$TRAIN_GPU_POOL")
     echo "==== ${run_name} ===="
@@ -117,6 +113,7 @@ do
     LAUNCHER="$LAUNCHER" \
     TRAIN_BATCH_SIZE="$train_bsz" \
     ROLLOUT_N="$rollout_n" \
+    LOGPROB_MICRO_BATCH_SIZE="${LOGPROB_MICRO_BATCH_SIZE:-4}" \
     TOTAL_TRAINING_STEPS="$steps" \
     SAVE_FREQ="$steps" \
     TEST_FREQ="$steps" \
@@ -128,4 +125,4 @@ do
     EVAL_ROLLOUT_N="${EVAL_ROLLOUT_N:-1}" \
     SAVE_EVAL_IMAGES="${SAVE_EVAL_IMAGES:-0}" \
     bash "$SCRIPT_DIR/run_janus_ocr_lora_grpo.sh"
-done
+done <<< "$SWEEP_SPECS"

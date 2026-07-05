@@ -99,6 +99,7 @@ CFG_WEIGHT=${CFG_WEIGHT:-5.0}
 TEMPERATURE=${TEMPERATURE:-1.0}
 MAX_IMAGE_TOKENS=${MAX_IMAGE_TOKENS:-576}
 TOKEN_CHUNK_SIZE=${TOKEN_CHUNK_SIZE:-64}
+LOGPROB_MICRO_BATCH_SIZE=${LOGPROB_MICRO_BATCH_SIZE:-4}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
@@ -126,6 +127,7 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-15}
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     export CUDA_VISIBLE_DEVICES=0,1,2,3
 fi
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 if [[ ! -d "$JANUS_CODE_PATH/janus" ]]; then
     echo "Missing Janus official code at $JANUS_CODE_PATH" >&2
@@ -234,6 +236,7 @@ args=(
     --temperature "$TEMPERATURE"
     --max-image-tokens "$MAX_IMAGE_TOKENS"
     --token-chunk-size "$TOKEN_CHUNK_SIZE"
+    --logprob-micro-batch-size "$LOGPROB_MICRO_BATCH_SIZE"
     --eval-samples "$EVAL_SAMPLES"
     --eval-rollout-n "$EVAL_ROLLOUT_N"
     --log-val-generations "$LOG_VAL_GENERATIONS"

@@ -605,7 +605,7 @@ def wandb_config(args) -> dict:
         "actor": {
             "optim": {"lr": args.learning_rate, "weight_decay": args.weight_decay},
             "ppo_mini_batch_size": args.train_batch_size,
-            "ppo_micro_batch_size_per_gpu": 1,
+            "ppo_micro_batch_size_per_gpu": args.logprob_micro_batch_size,
         },
         "rollout": {
             "name": "janus_ar",
@@ -701,6 +701,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--max-image-tokens", type=int, default=576)
     parser.add_argument("--token-chunk-size", type=int, default=64)
+    parser.add_argument("--logprob-micro-batch-size", type=int, default=4)
 
     parser.add_argument("--reward-mode", choices=["openai_ocr", "dummy"], default="openai_ocr")
     parser.add_argument("--reward-url", default="http://127.0.0.1:8000/v1/chat/completions")
@@ -817,19 +818,20 @@ def run_worker(args: argparse.Namespace) -> None:
                 decode = args.reward_mode != "dummy"
                 prompt_lengths.append(int(make_janus_prompt(processor, row.prompt).numel()))
                 gen_one_start = time.perf_counter()
-                tokens, old_logprobs, images = generate_group(
-                    model=model,
-                    processor=processor,
-                    prompt_text=row.prompt,
-                    n=args.rollout_n,
-                    cfg_weight=args.cfg_weight,
-                    temperature=args.temperature,
-                    max_image_tokens=args.max_image_tokens,
-                    image_size=args.image_size,
-                    patch_size=args.patch_size,
-                    device=device,
-                    decode=decode,
-                )
+                with torch.no_grad():
+                    tokens, old_logprobs, images = generate_group(
+                        model=model,
+                        processor=processor,
+                        prompt_text=row.prompt,
+                        n=args.rollout_n,
+                        cfg_weight=args.cfg_weight,
+                        temperature=args.temperature,
+                        max_image_tokens=args.max_image_tokens,
+                        image_size=args.image_size,
+                        patch_size=args.patch_size,
+                        device=device,
+                        decode=decode,
+                    )
                 response_lengths.append(int(tokens.shape[-1]))
                 gen_times.append(time.perf_counter() - gen_one_start)
                 reward_one_start = time.perf_counter()
@@ -862,6 +864,7 @@ def run_worker(args: argparse.Namespace) -> None:
             update_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             actor_losses = []
+            actor_loss_count = 0
             ratio_values = []
             ratio_std_values = []
             clip_values = []
@@ -878,30 +881,50 @@ def run_worker(args: argparse.Namespace) -> None:
                     tokens = tokens.to(device)
                     old_logprobs = old_logprobs.to(device)
                     adv = adv.to(device)
-                    new_logprobs = guided_logprobs(
-                        model=model,
-                        processor=processor,
-                        prompt_text=row.prompt,
-                        generated_tokens=tokens,
-                        cfg_weight=args.cfg_weight,
-                        temperature=args.temperature,
-                        token_chunk_size=args.token_chunk_size,
-                        device=device,
+                    micro_batch_size = (
+                        tokens.shape[0]
+                        if args.logprob_micro_batch_size <= 0
+                        else min(args.logprob_micro_batch_size, tokens.shape[0])
                     )
-                    ratio = torch.exp(new_logprobs - old_logprobs)
-                    ratio_float = ratio.detach().float()
-                    adv_tokens = adv[:, None].expand_as(ratio)
-                    unclipped = ratio * adv_tokens
-                    clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * adv_tokens
-                    raw_loss = -torch.min(unclipped, clipped).mean()
-                    loss = raw_loss * state.world_size / args.train_batch_size / args.ppo_epochs
-                    loss.backward()
-                    actor_losses.append(raw_loss.detach().float())
-                    ratio_values.append(ratio_float.mean())
-                    ratio_std_values.append(ratio_float.std(unbiased=False))
-                    clip_values.append((torch.abs(ratio_float - 1.0) > args.clip_ratio).float().mean())
-                    clip_high_values.append((ratio_float > 1.0 + args.clip_ratio).float().mean())
-                    clip_low_values.append((ratio_float < 1.0 - args.clip_ratio).float().mean())
+                    total_token_count = max(1, int(tokens.numel()))
+                    for micro_start in range(0, tokens.shape[0], micro_batch_size):
+                        micro_end = min(tokens.shape[0], micro_start + micro_batch_size)
+                        micro_tokens = tokens[micro_start:micro_end].contiguous()
+                        micro_old_logprobs = old_logprobs[micro_start:micro_end].contiguous()
+                        micro_adv = adv[micro_start:micro_end].contiguous()
+                        new_logprobs = guided_logprobs(
+                            model=model,
+                            processor=processor,
+                            prompt_text=row.prompt,
+                            generated_tokens=micro_tokens,
+                            cfg_weight=args.cfg_weight,
+                            temperature=args.temperature,
+                            token_chunk_size=args.token_chunk_size,
+                            device=device,
+                        )
+                        ratio = torch.exp(new_logprobs - micro_old_logprobs)
+                        ratio_float = ratio.detach().float()
+                        adv_tokens = micro_adv[:, None].expand_as(ratio)
+                        unclipped = ratio * adv_tokens
+                        clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * adv_tokens
+                        raw_loss = -torch.min(unclipped, clipped).mean()
+                        micro_token_count = int(micro_tokens.numel())
+                        loss_scale = micro_token_count / total_token_count
+                        loss = (
+                            raw_loss
+                            * loss_scale
+                            * state.world_size
+                            / args.train_batch_size
+                            / args.ppo_epochs
+                        )
+                        loss.backward()
+                        actor_losses.append(raw_loss.detach().float() * micro_token_count)
+                        actor_loss_count += micro_token_count
+                        ratio_values.append(ratio_float.mean())
+                        ratio_std_values.append(ratio_float.std(unbiased=False))
+                        clip_values.append((torch.abs(ratio_float - 1.0) > args.clip_ratio).float().mean())
+                        clip_high_values.append((ratio_float > 1.0 + args.clip_ratio).float().mean())
+                        clip_low_values.append((ratio_float < 1.0 - args.clip_ratio).float().mean())
 
             update_actor_time = time.perf_counter() - update_start
             update_weights_start = time.perf_counter()
@@ -919,7 +942,7 @@ def run_worker(args: argparse.Namespace) -> None:
             local_step_time = float(step_time)
             global_step_time = reduce_float(local_step_time, state, device, op=dist.ReduceOp.MAX)
             global_images = int(args.train_batch_size * args.rollout_n)
-            actor_count = len(actor_losses)
+            actor_count = actor_loss_count
             reward_count = int(reward_flat.size)
             prompt_count = len(batch_rows)
             advantage_count = int(advantage_flat.size)
