@@ -601,7 +601,18 @@ def wandb_config(args) -> dict:
     return config
 
 
+def trainer_logger_backends(args) -> list[str]:
+    value = args.trainer_logger
+    if isinstance(value, str):
+        parsed = json.loads(value)
+    else:
+        parsed = value
+    return [str(item) for item in parsed]
+
+
 def init_wandb(args, output_dir: Path):
+    if "wandb" not in trainer_logger_backends(args):
+        return None
     if args.wandb_mode == "disabled":
         return None
     import wandb  # noqa: PLC0415
