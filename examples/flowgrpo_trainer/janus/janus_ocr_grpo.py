@@ -53,6 +53,40 @@ class DistributedState:
     owns_process_group: bool
 
 
+@dataclass
+class RolloutBatch:
+    rows: list[PromptRow]
+    tokens: list[torch.Tensor]
+    old_logprobs: list[torch.Tensor]
+    rewards: torch.Tensor
+    advantages: torch.Tensor
+    advantages_per_gpu: torch.Tensor
+    gen_times: list[float]
+    reward_times: list[float]
+    prompt_lengths: list[int]
+    response_lengths: list[int]
+    rollout_time: float
+    adv_time: float
+
+
+@dataclass
+class ActorUpdateStats:
+    loss_sum: float
+    ratio_sum: float
+    ratio_std_sum: float
+    clipfrac_sum: float
+    clipfrac_higher_sum: float
+    clipfrac_lower_sum: float
+    token_count: int
+    update_actor_time: float
+
+
+@dataclass
+class WeightUpdateStats:
+    grad_norm: float
+    update_weights_time: float
+
+
 def init_distributed(args) -> DistributedState:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -134,14 +168,6 @@ def reduce_extreme(
     if value in (float("inf"), float("-inf")):
         return 0.0
     return float(value)
-
-
-def zero_trainable_loss(params: list[torch.nn.Parameter], device: torch.device) -> torch.Tensor:
-    loss = torch.zeros((), device=device)
-    for param in params:
-        if param.requires_grad:
-            loss = loss + param.sum() * 0.0
-    return loss
 
 
 def patch_transformers_for_janus() -> None:
@@ -447,6 +473,21 @@ def group_advantages(rewards: torch.Tensor) -> torch.Tensor:
     return torch.where(std > 0, adv, torch.zeros_like(adv))
 
 
+def all_gather_rollout_group(local_values: torch.Tensor, state: DistributedState) -> torch.Tensor:
+    if not state.enabled:
+        return local_values
+    gathered = [torch.empty_like(local_values) for _ in range(state.world_size)]
+    dist.all_gather(gathered, local_values)
+    return torch.cat(gathered, dim=1)
+
+
+def rollout_shard_bounds(rollout_n: int, state: DistributedState) -> tuple[int, int, int]:
+    rollout_n_per_gpu = rollout_n // state.world_size if state.enabled else rollout_n
+    start = state.rank * rollout_n_per_gpu if state.enabled else 0
+    end = start + rollout_n_per_gpu
+    return rollout_n_per_gpu, start, end
+
+
 def setup_lora(model, args):
     from peft import LoraConfig, PeftModel, get_peft_model  # noqa: PLC0415
 
@@ -604,15 +645,19 @@ def wandb_config(args) -> dict:
         },
         "actor": {
             "optim": {"lr": args.learning_rate, "weight_decay": args.weight_decay},
-            "ppo_mini_batch_size": args.train_batch_size,
-            "ppo_micro_batch_size_per_gpu": args.logprob_micro_batch_size,
+            "ppo_mini_batch_size": args.ppo_mini_batch_size,
+            "ppo_micro_batch_size_per_gpu": args.ppo_micro_batch_size_per_gpu,
         },
         "rollout": {
             "name": "janus_ar",
+            "log_prob_micro_batch_size_per_gpu": args.log_prob_micro_batch_size_per_gpu,
             "n": args.rollout_n,
             "max_image_tokens": args.max_image_tokens,
             "cfg_weight": args.cfg_weight,
             "temperature": args.temperature,
+        },
+        "ref": {
+            "log_prob_micro_batch_size_per_gpu": args.log_prob_micro_batch_size_per_gpu,
         },
     }
     config["reward"] = {
@@ -679,6 +724,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ray-storage-path", default="")
 
     parser.add_argument("--train-batch-size", type=int, default=1)
+    parser.add_argument("--ppo-mini-batch-size", type=int, default=1)
+    parser.add_argument("--ppo-micro-batch-size-per-gpu", type=int, default=1)
     parser.add_argument("--rollout-n", type=int, default=4)
     parser.add_argument("--total-training-steps", type=int, default=1)
     parser.add_argument("--ppo-epochs", type=int, default=1)
@@ -701,7 +748,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--max-image-tokens", type=int, default=576)
     parser.add_argument("--token-chunk-size", type=int, default=64)
-    parser.add_argument("--logprob-micro-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--log-prob-micro-batch-size-per-gpu",
+        "--logprob-micro-batch-size",
+        dest="log_prob_micro_batch_size_per_gpu",
+        type=int,
+        default=1,
+    )
 
     parser.add_argument("--reward-mode", choices=["openai_ocr", "dummy"], default="openai_ocr")
     parser.add_argument("--reward-url", default="http://127.0.0.1:8000/v1/chat/completions")
@@ -730,43 +783,532 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_worker(args: argparse.Namespace) -> None:
+def validate_training_args(args: argparse.Namespace, state: DistributedState) -> None:
     if args.max_image_tokens != 576 and args.reward_mode != "dummy":
         raise SystemExit("Non-dummy OCR reward requires full 576-token Janus images.")
 
-    state = init_distributed(args)
-    if state.enabled and args.train_batch_size % state.world_size != 0:
+    if args.ppo_mini_batch_size != args.train_batch_size:
         raise SystemExit(
-            "Ray/DDP Janus uses TRAIN_BATCH_SIZE as a global prompt batch. "
-            f"It must be divisible by world_size={state.world_size}, got {args.train_batch_size}. "
-            "Use fewer GPUs or increase TRAIN_BATCH_SIZE."
+            "Janus OCR currently updates one global prompt batch per PPO epoch. "
+            f"Set PPO_MINI_BATCH_SIZE equal to TRAIN_BATCH_SIZE ({args.train_batch_size}), "
+            f"got {args.ppo_mini_batch_size}."
         )
+
+    if state.enabled and args.rollout_n % state.world_size != 0:
+        raise SystemExit(
+            "Ray/DDP Janus shards each prompt's rollout group across workers. "
+            f"ROLLOUT_N must be divisible by world_size={state.world_size}, got {args.rollout_n}. "
+            "Use fewer GPUs or set ROLLOUT_N to a multiple of the GPU count."
+        )
+
+
+def load_model_and_processor(args: argparse.Namespace, state: DistributedState):
+    seed_everything(args.seed)
+    VLChatProcessor = import_janus(args.janus_code_path)
+    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
+    clean_config_fields(config)
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
+    processor = VLChatProcessor.from_pretrained(args.model_path, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        config=config,
+        trust_remote_code=True,
+        local_files_only=True,
+        torch_dtype=dtype,
+    ).to(device)
+    model = setup_lora(model, args).to(device)
+    if state.enabled and not args.eval_only:
+        model.language_model = DDP(
+            model.language_model,
+            device_ids=[state.local_rank],
+            output_device=state.local_rank,
+            find_unused_parameters=False,
+        )
+    model.train()
+    if state.enabled:
+        seed_everything(args.seed + state.rank * 100_003)
+    return model, processor, device
+
+
+def select_training_batch(
+    train_rows: list[PromptRow],
+    step: int,
+    train_batch_size: int,
+) -> tuple[list[PromptRow], int]:
+    global_offset = (step - 1) * train_batch_size
+    rows = [train_rows[(global_offset + i) % len(train_rows)] for i in range(train_batch_size)]
+    return rows, global_offset
+
+
+def compute_advantage(
+    local_rewards: torch.Tensor,
+    args: argparse.Namespace,
+    state: DistributedState,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    adv_start = time.perf_counter()
+    rewards = all_gather_rollout_group(local_rewards, state)
+    advantages = group_advantages(rewards)
+    _, rollout_start_idx, rollout_end_idx = rollout_shard_bounds(args.rollout_n, state)
+    advantages_per_gpu = advantages[:, rollout_start_idx:rollout_end_idx]
+    return rewards, advantages, advantages_per_gpu, time.perf_counter() - adv_start
+
+
+def generate_rollout_batch(
+    model,
+    processor,
+    rows: list[PromptRow],
+    args: argparse.Namespace,
+    state: DistributedState,
+    device: torch.device,
+) -> RolloutBatch:
+    rollout_start = time.perf_counter()
+    rollout_n_per_gpu, _, _ = rollout_shard_bounds(args.rollout_n, state)
+
+    group_tokens: list[torch.Tensor] = []
+    group_old_logprobs: list[torch.Tensor] = []
+    reward_rows: list[list[float]] = []
+    gen_times: list[float] = []
+    reward_times: list[float] = []
+    prompt_lengths: list[int] = []
+    response_lengths: list[int] = []
+
+    for row in rows:
+        prompt_lengths.append(int(make_janus_prompt(processor, row.prompt).numel()))
+        gen_one_start = time.perf_counter()
+        with torch.no_grad():
+            tokens, old_logprobs, images = generate_group(
+                model=model,
+                processor=processor,
+                prompt_text=row.prompt,
+                n=rollout_n_per_gpu,
+                cfg_weight=args.cfg_weight,
+                temperature=args.temperature,
+                max_image_tokens=args.max_image_tokens,
+                image_size=args.image_size,
+                patch_size=args.patch_size,
+                device=device,
+                decode=args.reward_mode != "dummy",
+            )
+        response_lengths.append(int(tokens.shape[-1]))
+        gen_times.append(time.perf_counter() - gen_one_start)
+
+        reward_one_start = time.perf_counter()
+        if args.reward_mode == "dummy":
+            scores, _ = dummy_scores(rollout_n_per_gpu, row.ground_truth, row.index + state.rank * 1_000_000)
+        else:
+            scores, _ = score_images_openai_ocr(
+                images,
+                row.ground_truth,
+                args.reward_url,
+                args.reward_model,
+                args.reward_timeout,
+            )
+        reward_times.append(time.perf_counter() - reward_one_start)
+
+        group_tokens.append(tokens.clone())
+        group_old_logprobs.append(old_logprobs.clone())
+        reward_rows.append(scores)
+
+    local_rewards = (
+        torch.tensor(reward_rows, dtype=torch.float32, device=device)
+        if reward_rows
+        else torch.empty((0, rollout_n_per_gpu), dtype=torch.float32, device=device)
+    )
+    rollout_time = time.perf_counter() - rollout_start
+    rewards, advantages, advantages_per_gpu, adv_time = compute_advantage(local_rewards, args, state)
+    return RolloutBatch(
+        rows=rows,
+        tokens=group_tokens,
+        old_logprobs=group_old_logprobs,
+        rewards=rewards,
+        advantages=advantages,
+        advantages_per_gpu=advantages_per_gpu,
+        gen_times=gen_times,
+        reward_times=reward_times,
+        prompt_lengths=prompt_lengths,
+        response_lengths=response_lengths,
+        rollout_time=rollout_time,
+        adv_time=adv_time,
+    )
+
+
+def update_actor(
+    model,
+    processor,
+    optimizer: torch.optim.Optimizer,
+    rollout_batch: RolloutBatch,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> ActorUpdateStats:
+    update_start = time.perf_counter()
+    optimizer.zero_grad(set_to_none=True)
+    actor_losses = []
+    actor_loss_count = 0
+    ratio_values = []
+    ratio_std_values = []
+    clip_values = []
+    clip_high_values = []
+    clip_low_values = []
+
+    for _ in range(args.ppo_epochs):
+        local_items = zip(
+            rollout_batch.rows,
+            rollout_batch.tokens,
+            rollout_batch.old_logprobs,
+            rollout_batch.advantages_per_gpu,
+        )
+        for row, tokens, old_logprobs, adv in local_items:
+            tokens = tokens.to(device)
+            old_logprobs = old_logprobs.to(device)
+            adv = adv.to(device)
+            micro_batch_size = (
+                tokens.shape[0]
+                if args.ppo_micro_batch_size_per_gpu <= 0
+                else min(args.ppo_micro_batch_size_per_gpu, tokens.shape[0])
+            )
+            total_token_count = max(1, int(tokens.numel()))
+            for micro_start in range(0, tokens.shape[0], micro_batch_size):
+                micro_end = min(tokens.shape[0], micro_start + micro_batch_size)
+                micro_tokens = tokens[micro_start:micro_end].contiguous()
+                micro_old_logprobs = old_logprobs[micro_start:micro_end].contiguous()
+                micro_adv = adv[micro_start:micro_end].contiguous()
+                new_logprobs = guided_logprobs(
+                    model=model,
+                    processor=processor,
+                    prompt_text=row.prompt,
+                    generated_tokens=micro_tokens,
+                    cfg_weight=args.cfg_weight,
+                    temperature=args.temperature,
+                    token_chunk_size=args.token_chunk_size,
+                    device=device,
+                )
+                ratio = torch.exp(new_logprobs - micro_old_logprobs)
+                ratio_float = ratio.detach().float()
+                adv_tokens = micro_adv[:, None].expand_as(ratio)
+                unclipped = ratio * adv_tokens
+                clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * adv_tokens
+                raw_loss = -torch.min(unclipped, clipped).mean()
+                micro_token_count = int(micro_tokens.numel())
+                loss_scale = micro_token_count / total_token_count
+                loss = raw_loss * loss_scale / args.train_batch_size / args.ppo_epochs
+                loss.backward()
+
+                actor_losses.append(raw_loss.detach().float() * micro_token_count)
+                actor_loss_count += micro_token_count
+                ratio_values.append(ratio_float.mean() * micro_token_count)
+                ratio_std_values.append(ratio_float.std(unbiased=False) * micro_token_count)
+                clip_values.append((torch.abs(ratio_float - 1.0) > args.clip_ratio).float().mean() * micro_token_count)
+                clip_high_values.append(
+                    (ratio_float > 1.0 + args.clip_ratio).float().mean() * micro_token_count
+                )
+                clip_low_values.append((ratio_float < 1.0 - args.clip_ratio).float().mean() * micro_token_count)
+
+    return ActorUpdateStats(
+        loss_sum=float(torch.stack(actor_losses).sum().item()) if actor_losses else 0.0,
+        ratio_sum=float(torch.stack(ratio_values).sum().item()) if ratio_values else 0.0,
+        ratio_std_sum=float(torch.stack(ratio_std_values).sum().item()) if ratio_std_values else 0.0,
+        clipfrac_sum=float(torch.stack(clip_values).sum().item()) if clip_values else 0.0,
+        clipfrac_higher_sum=float(torch.stack(clip_high_values).sum().item()) if clip_high_values else 0.0,
+        clipfrac_lower_sum=float(torch.stack(clip_low_values).sum().item()) if clip_low_values else 0.0,
+        token_count=actor_loss_count,
+        update_actor_time=time.perf_counter() - update_start,
+    )
+
+
+def update_weights(
+    params: list[torch.nn.Parameter],
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+) -> WeightUpdateStats:
+    update_weights_start = time.perf_counter()
+    grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
+    optimizer.step()
+    grad_norm_value = float(grad_norm.detach().cpu().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+    return WeightUpdateStats(
+        grad_norm=grad_norm_value,
+        update_weights_time=time.perf_counter() - update_weights_start,
+    )
+
+
+def compute_training_metrics(
+    step: int,
+    global_offset: int,
+    train_rows: list[PromptRow],
+    rollout_batch: RolloutBatch,
+    actor_stats: ActorUpdateStats,
+    weight_stats: WeightUpdateStats,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    state: DistributedState,
+    device: torch.device,
+    step_time: float,
+) -> dict[str, float]:
+    rewards_np = rollout_batch.rewards.detach().cpu().numpy()
+    advantages_np = rollout_batch.advantages.detach().cpu().numpy()
+    reward_flat = rewards_np.reshape(-1)
+    advantage_flat = advantages_np.reshape(-1)
+    per_prompt_std = rewards_np.std(axis=1) if len(rewards_np) else np.array([], dtype=np.float32)
+
+    global_step_time = reduce_float(float(step_time), state, device, op=dist.ReduceOp.MAX)
+    global_images = int(args.train_batch_size * args.rollout_n)
+    n_gpus = state.world_size if state.enabled else 1
+    actor_count = actor_stats.token_count
+    reward_count = int(reward_flat.size)
+    prompt_count = len(rollout_batch.rows)
+    advantage_count = int(advantage_flat.size)
+    gen_time = reduce_float(float(sum(rollout_batch.gen_times)), state, device, op=dist.ReduceOp.MAX)
+    reward_time = reduce_float(float(sum(rollout_batch.reward_times)), state, device, op=dist.ReduceOp.MAX)
+    adv_time = reduce_float(float(rollout_batch.adv_time), state, device, op=dist.ReduceOp.MAX)
+    update_actor_time = reduce_float(float(actor_stats.update_actor_time), state, device, op=dist.ReduceOp.MAX)
+    update_weights_time = reduce_float(float(weight_stats.update_weights_time), state, device, op=dist.ReduceOp.MAX)
+
+    metrics = {
+        "training/global_step": step,
+        "training/epoch": int(global_offset // max(1, len(train_rows))),
+        "training/seen_prompts": int(step * args.train_batch_size),
+        "actor/ppo_kl": 0.0,
+        "actor/loss": reduce_weighted_mean(actor_stats.loss_sum, actor_count, state, device),
+        "actor/ratio_mean": reduce_weighted_mean(actor_stats.ratio_sum, actor_count, state, device),
+        "actor/ratio_std": reduce_weighted_mean(actor_stats.ratio_std_sum, actor_count, state, device),
+        "actor/pg_clipfrac": reduce_weighted_mean(actor_stats.clipfrac_sum, actor_count, state, device),
+        "actor/pg_clipfrac_higher": reduce_weighted_mean(
+            actor_stats.clipfrac_higher_sum,
+            actor_count,
+            state,
+            device,
+        ),
+        "actor/pg_clipfrac_lower": reduce_weighted_mean(
+            actor_stats.clipfrac_lower_sum,
+            actor_count,
+            state,
+            device,
+        ),
+        "actor/grad_norm": reduce_float(weight_stats.grad_norm, state, device),
+        "actor/lr": optimizer.param_groups[0]["lr"],
+        "critic/rewards/mean": reduce_weighted_mean(
+            float(reward_flat.sum()) if reward_count else 0.0,
+            reward_count,
+            state,
+            device,
+        ),
+        "critic/rewards/max": reduce_extreme(
+            float(reward_flat.max()) if reward_count else 0.0,
+            reward_count,
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "critic/rewards/min": reduce_extreme(
+            float(reward_flat.min()) if reward_count else 0.0,
+            reward_count,
+            state,
+            device,
+            op=dist.ReduceOp.MIN,
+        ),
+        "critic/advantages/mean": reduce_weighted_mean(
+            float(advantage_flat.sum()) if advantage_count else 0.0,
+            advantage_count,
+            state,
+            device,
+        ),
+        "critic/advantages/max": reduce_extreme(
+            float(advantage_flat.max()) if advantage_count else 0.0,
+            advantage_count,
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "critic/advantages/min": reduce_extreme(
+            float(advantage_flat.min()) if advantage_count else 0.0,
+            advantage_count,
+            state,
+            device,
+            op=dist.ReduceOp.MIN,
+        ),
+        "critic/returns/mean": reduce_weighted_mean(
+            float(advantage_flat.sum()) if advantage_count else 0.0,
+            advantage_count,
+            state,
+            device,
+        ),
+        "critic/returns/max": reduce_extreme(
+            float(advantage_flat.max()) if advantage_count else 0.0,
+            advantage_count,
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "critic/returns/min": reduce_extreme(
+            float(advantage_flat.min()) if advantage_count else 0.0,
+            advantage_count,
+            state,
+            device,
+            op=dist.ReduceOp.MIN,
+        ),
+        "critic/rewards/std_mean": reduce_weighted_mean(
+            float(per_prompt_std.sum()) if prompt_count else 0.0,
+            prompt_count,
+            state,
+            device,
+        ),
+        "critic/rewards/zero_std_ratio": reduce_weighted_mean(
+            float(np.sum(per_prompt_std == 0)) if prompt_count else 0.0,
+            prompt_count,
+            state,
+            device,
+        ),
+        "critic/rewards/group_size": float(args.rollout_n),
+        "critic/score/mean": reduce_weighted_mean(
+            float(reward_flat.sum()) if reward_count else 0.0,
+            reward_count,
+            state,
+            device,
+        ),
+        "perf/mfu/actor_infer": 0.0,
+        "perf/mfu/actor": 0.0,
+        "perf/total_num_images": global_images,
+        "perf/time_per_step": global_step_time,
+        "perf/throughput": float(global_images / (global_step_time * n_gpus)),
+        "timing_s/start_profile": 0.0,
+        "timing_s/gen": gen_time,
+        "timing_s/reward": reward_time,
+        "timing_s/gen_reward": reduce_float(float(rollout_batch.rollout_time), state, device, op=dist.ReduceOp.MAX),
+        "timing_s/old_log_prob": 0.0,
+        "timing_s/adv": adv_time,
+        "timing_s/update_actor": update_actor_time,
+        "timing_s/update_weights": update_weights_time,
+        "timing_s/step": global_step_time,
+        "timing_s/stop_profile": 0.0,
+        "timing_s/agent_loop/generate_sequences/min": reduce_extreme(
+            min(rollout_batch.gen_times) if rollout_batch.gen_times else 0.0,
+            len(rollout_batch.gen_times),
+            state,
+            device,
+            op=dist.ReduceOp.MIN,
+        ),
+        "timing_s/agent_loop/generate_sequences/max": reduce_extreme(
+            max(rollout_batch.gen_times) if rollout_batch.gen_times else 0.0,
+            len(rollout_batch.gen_times),
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "timing_s/agent_loop/generate_sequences/mean": reduce_weighted_mean(
+            float(sum(rollout_batch.gen_times)),
+            len(rollout_batch.gen_times),
+            state,
+            device,
+        ),
+        "timing_s/agent_loop/compute_score/min": reduce_extreme(
+            min(rollout_batch.reward_times) if rollout_batch.reward_times else 0.0,
+            len(rollout_batch.reward_times),
+            state,
+            device,
+            op=dist.ReduceOp.MIN,
+        ),
+        "timing_s/agent_loop/compute_score/max": reduce_extreme(
+            max(rollout_batch.reward_times) if rollout_batch.reward_times else 0.0,
+            len(rollout_batch.reward_times),
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "timing_s/agent_loop/compute_score/mean": reduce_weighted_mean(
+            float(sum(rollout_batch.reward_times)),
+            len(rollout_batch.reward_times),
+            state,
+            device,
+        ),
+        "timing_s/agent_loop/tool_calls/min": 0.0,
+        "timing_s/agent_loop/tool_calls/max": 0.0,
+        "timing_s/agent_loop/tool_calls/mean": 0.0,
+        "timing_s/agent_loop/num_preempted/min": -1,
+        "timing_s/agent_loop/num_preempted/max": -1,
+        "timing_s/agent_loop/num_preempted/mean": -1.0,
+        "timing_s/agent_loop/slowest/generate_sequences": reduce_extreme(
+            max(rollout_batch.gen_times) if rollout_batch.gen_times else 0.0,
+            len(rollout_batch.gen_times),
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "timing_s/agent_loop/slowest/compute_score": reduce_extreme(
+            max(rollout_batch.reward_times) if rollout_batch.reward_times else 0.0,
+            len(rollout_batch.reward_times),
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "timing_s/agent_loop/slowest/tool_calls": 0.0,
+        "timing_s/agent_loop/slowest/num_preempted": -1,
+        "timing_s/agent_loop/slowest/prompt_length": reduce_extreme(
+            max(rollout_batch.prompt_lengths) if rollout_batch.prompt_lengths else 0.0,
+            len(rollout_batch.prompt_lengths),
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+        "timing_s/agent_loop/slowest/response_length": reduce_extreme(
+            max(rollout_batch.response_lengths) if rollout_batch.response_lengths else 0.0,
+            len(rollout_batch.response_lengths),
+            state,
+            device,
+            op=dist.ReduceOp.MAX,
+        ),
+    }
+    metrics.update(
+        {
+            "timing_per_image_ms/gen": float(gen_time * 1000 / global_images),
+            "timing_per_image_ms/reward": float(reward_time * 1000 / global_images),
+            "timing_per_image_ms/old_log_prob": 0.0,
+            "timing_per_image_ms/adv": float(adv_time * 1000 / global_images),
+            "timing_per_image_ms/update_actor": float(update_actor_time * 1000 / global_images),
+        }
+    )
+    return metrics
+
+
+def log_training_step(run, metrics: dict[str, float], step: int, args: argparse.Namespace, state: DistributedState) -> None:
+    if run is not None:
+        run.log(metrics, step=step)
+    if is_main_process(state) and step % args.log_every == 0:
+        print("step:" + str(step) + " - " + " - ".join(f"{k}:{v}" for k, v in metrics.items()))
+
+
+def save_adapter_and_evaluate(
+    model,
+    processor,
+    val_rows: list[PromptRow],
+    args: argparse.Namespace,
+    device: torch.device,
+    output_dir: Path,
+    run,
+) -> None:
+    adapter_dir = output_dir / "adapter"
+    model.language_model.save_pretrained(adapter_dir)
+    print(f"saved adapter: {adapter_dir}")
+
+    if args.eval_at_end:
+        eval_metrics = evaluate(model, processor, val_rows, args, device, output_dir, step=args.total_training_steps)
+        print("final_eval:" + json.dumps(eval_metrics, ensure_ascii=False))
+        if run is not None:
+            run.log(eval_metrics, step=args.total_training_steps)
+            log_eval_generations_to_wandb(
+                run,
+                output_dir,
+                step=args.total_training_steps,
+                limit=args.log_val_generations,
+            )
+
+
+def run_worker(args: argparse.Namespace) -> None:
+    state = init_distributed(args)
     run = None
     try:
-        seed_everything(args.seed)
-        VLChatProcessor = import_janus(args.janus_code_path)
-        config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
-        clean_config_fields(config)
-
-        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-        dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
-        processor = VLChatProcessor.from_pretrained(args.model_path, local_files_only=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            config=config,
-            trust_remote_code=True,
-            local_files_only=True,
-            torch_dtype=dtype,
-        ).to(device)
-        model = setup_lora(model, args).to(device)
-        if state.enabled and not args.eval_only:
-            model.language_model = DDP(
-                model.language_model,
-                device_ids=[state.local_rank],
-                output_device=state.local_rank,
-                find_unused_parameters=False,
-            )
-        model.train()
+        validate_training_args(args, state)
+        model, processor, device = load_model_and_processor(args, state)
 
         train_limit = args.max_train_rows if args.max_train_rows > 0 else None
         train_rows = load_rows(Path(args.train_file), limit=train_limit)
@@ -793,414 +1335,43 @@ def run_worker(args: argparse.Namespace) -> None:
 
         for step in range(1, args.total_training_steps + 1):
             step_start = time.perf_counter()
-            rollout_start = time.perf_counter()
-            batch_rows = []
-            global_offset = (step - 1) * args.train_batch_size
-            for i in range(args.train_batch_size):
-                if not state.enabled or i % state.world_size == state.rank:
-                    batch_rows.append(train_rows[(global_offset + i) % len(train_rows)])
-            local_backward_slots = (
-                (args.train_batch_size + state.world_size - 1) // state.world_size
-                if state.enabled
-                else len(batch_rows)
+            batch_rows, global_offset = select_training_batch(train_rows, step, args.train_batch_size)
+
+            rollout_batch = generate_rollout_batch(
+                model=model,
+                processor=processor,
+                rows=batch_rows,
+                args=args,
+                state=state,
+                device=device,
             )
-
-            group_tokens: list[torch.Tensor] = []
-            group_old_logprobs: list[torch.Tensor] = []
-            reward_rows: list[list[float]] = []
-            ocr_text_rows: list[list[str]] = []
-            gen_times: list[float] = []
-            reward_times: list[float] = []
-            prompt_lengths: list[int] = []
-            response_lengths: list[int] = []
-
-            for row in batch_rows:
-                decode = args.reward_mode != "dummy"
-                prompt_lengths.append(int(make_janus_prompt(processor, row.prompt).numel()))
-                gen_one_start = time.perf_counter()
-                with torch.no_grad():
-                    tokens, old_logprobs, images = generate_group(
-                        model=model,
-                        processor=processor,
-                        prompt_text=row.prompt,
-                        n=args.rollout_n,
-                        cfg_weight=args.cfg_weight,
-                        temperature=args.temperature,
-                        max_image_tokens=args.max_image_tokens,
-                        image_size=args.image_size,
-                        patch_size=args.patch_size,
-                        device=device,
-                        decode=decode,
-                    )
-                response_lengths.append(int(tokens.shape[-1]))
-                gen_times.append(time.perf_counter() - gen_one_start)
-                reward_one_start = time.perf_counter()
-                if args.reward_mode == "dummy":
-                    scores, texts = dummy_scores(args.rollout_n, row.ground_truth, row.index)
-                else:
-                    scores, texts = score_images_openai_ocr(
-                        images,
-                        row.ground_truth,
-                        args.reward_url,
-                        args.reward_model,
-                        args.reward_timeout,
-                    )
-                reward_times.append(time.perf_counter() - reward_one_start)
-                group_tokens.append(tokens.clone())
-                group_old_logprobs.append(old_logprobs.clone())
-                reward_rows.append(scores)
-                ocr_text_rows.append(texts)
-            rollout_time = time.perf_counter() - rollout_start
-
-            rewards = (
-                torch.tensor(reward_rows, dtype=torch.float32, device=device)
-                if reward_rows
-                else torch.empty((0, args.rollout_n), dtype=torch.float32, device=device)
+            actor_stats = update_actor(
+                model=model,
+                processor=processor,
+                optimizer=optimizer,
+                rollout_batch=rollout_batch,
+                args=args,
+                device=device,
             )
-            adv_start = time.perf_counter()
-            advantages = group_advantages(rewards)
-            adv_time = time.perf_counter() - adv_start
-
-            update_start = time.perf_counter()
-            optimizer.zero_grad(set_to_none=True)
-            actor_losses = []
-            actor_loss_count = 0
-            ratio_values = []
-            ratio_std_values = []
-            clip_values = []
-            clip_high_values = []
-            clip_low_values = []
-            for _ in range(args.ppo_epochs):
-                local_items = list(zip(batch_rows, group_tokens, group_old_logprobs, advantages))
-                for slot in range(local_backward_slots):
-                    if slot >= len(local_items):
-                        if state.enabled:
-                            (zero_trainable_loss(params, device) / max(1, args.ppo_epochs)).backward()
-                        continue
-                    row, tokens, old_logprobs, adv = local_items[slot]
-                    tokens = tokens.to(device)
-                    old_logprobs = old_logprobs.to(device)
-                    adv = adv.to(device)
-                    micro_batch_size = (
-                        tokens.shape[0]
-                        if args.logprob_micro_batch_size <= 0
-                        else min(args.logprob_micro_batch_size, tokens.shape[0])
-                    )
-                    total_token_count = max(1, int(tokens.numel()))
-                    for micro_start in range(0, tokens.shape[0], micro_batch_size):
-                        micro_end = min(tokens.shape[0], micro_start + micro_batch_size)
-                        micro_tokens = tokens[micro_start:micro_end].contiguous()
-                        micro_old_logprobs = old_logprobs[micro_start:micro_end].contiguous()
-                        micro_adv = adv[micro_start:micro_end].contiguous()
-                        new_logprobs = guided_logprobs(
-                            model=model,
-                            processor=processor,
-                            prompt_text=row.prompt,
-                            generated_tokens=micro_tokens,
-                            cfg_weight=args.cfg_weight,
-                            temperature=args.temperature,
-                            token_chunk_size=args.token_chunk_size,
-                            device=device,
-                        )
-                        ratio = torch.exp(new_logprobs - micro_old_logprobs)
-                        ratio_float = ratio.detach().float()
-                        adv_tokens = micro_adv[:, None].expand_as(ratio)
-                        unclipped = ratio * adv_tokens
-                        clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * adv_tokens
-                        raw_loss = -torch.min(unclipped, clipped).mean()
-                        micro_token_count = int(micro_tokens.numel())
-                        loss_scale = micro_token_count / total_token_count
-                        loss = (
-                            raw_loss
-                            * loss_scale
-                            * state.world_size
-                            / args.train_batch_size
-                            / args.ppo_epochs
-                        )
-                        loss.backward()
-                        actor_losses.append(raw_loss.detach().float() * micro_token_count)
-                        actor_loss_count += micro_token_count
-                        ratio_values.append(ratio_float.mean())
-                        ratio_std_values.append(ratio_float.std(unbiased=False))
-                        clip_values.append((torch.abs(ratio_float - 1.0) > args.clip_ratio).float().mean())
-                        clip_high_values.append((ratio_float > 1.0 + args.clip_ratio).float().mean())
-                        clip_low_values.append((ratio_float < 1.0 - args.clip_ratio).float().mean())
-
-            update_actor_time = time.perf_counter() - update_start
-            update_weights_start = time.perf_counter()
-            grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
-            optimizer.step()
-            update_weights_time = time.perf_counter() - update_weights_start
-            update_time = time.perf_counter() - update_start
-            step_time = time.perf_counter() - step_start
-
-            rewards_np = rewards.detach().cpu().numpy()
-            advantages_np = advantages.detach().cpu().numpy()
-            reward_flat = rewards_np.reshape(-1)
-            advantage_flat = advantages_np.reshape(-1)
-            per_prompt_std = rewards_np.std(axis=1) if len(rewards_np) else np.array([], dtype=np.float32)
-            local_step_time = float(step_time)
-            global_step_time = reduce_float(local_step_time, state, device, op=dist.ReduceOp.MAX)
-            global_images = int(args.train_batch_size * args.rollout_n)
-            actor_count = actor_loss_count
-            reward_count = int(reward_flat.size)
-            prompt_count = len(batch_rows)
-            advantage_count = int(advantage_flat.size)
-            gen_time = reduce_float(float(sum(gen_times)), state, device, op=dist.ReduceOp.MAX)
-            reward_time = reduce_float(float(sum(reward_times)), state, device, op=dist.ReduceOp.MAX)
-            adv_time_global = reduce_float(float(adv_time), state, device, op=dist.ReduceOp.MAX)
-            update_actor_time_global = reduce_float(float(update_actor_time), state, device, op=dist.ReduceOp.MAX)
-            update_weights_time_global = reduce_float(float(update_weights_time), state, device, op=dist.ReduceOp.MAX)
-            metrics = {
-                "training/global_step": step,
-                "training/epoch": int(global_offset // max(1, len(train_rows))),
-                "training/seen_prompts": int(step * args.train_batch_size),
-                "actor/ppo_kl": 0.0,
-                "actor/loss": reduce_weighted_mean(
-                    float(torch.stack(actor_losses).sum().item()) if actor_losses else 0.0,
-                    actor_count,
-                    state,
-                    device,
-                ),
-                "actor/ratio_mean": reduce_weighted_mean(
-                    float(torch.stack(ratio_values).sum().item()) if ratio_values else 0.0,
-                    actor_count,
-                    state,
-                    device,
-                ),
-                "actor/ratio_std": reduce_weighted_mean(
-                    float(torch.stack(ratio_std_values).sum().item()) if ratio_std_values else 0.0,
-                    actor_count,
-                    state,
-                    device,
-                ),
-                "actor/pg_clipfrac": reduce_weighted_mean(
-                    float(torch.stack(clip_values).sum().item()) if clip_values else 0.0,
-                    actor_count,
-                    state,
-                    device,
-                ),
-                "actor/pg_clipfrac_higher": reduce_weighted_mean(
-                    float(torch.stack(clip_high_values).sum().item()) if clip_high_values else 0.0,
-                    actor_count,
-                    state,
-                    device,
-                ),
-                "actor/pg_clipfrac_lower": reduce_weighted_mean(
-                    float(torch.stack(clip_low_values).sum().item()) if clip_low_values else 0.0,
-                    actor_count,
-                    state,
-                    device,
-                ),
-                "actor/grad_norm": reduce_float(
-                    float(grad_norm.detach().cpu().item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
-                    state,
-                    device,
-                ),
-                "actor/lr": optimizer.param_groups[0]["lr"],
-                "critic/rewards/mean": reduce_weighted_mean(
-                    float(reward_flat.sum()) if reward_count else 0.0,
-                    reward_count,
-                    state,
-                    device,
-                ),
-                "critic/rewards/max": reduce_extreme(
-                    float(reward_flat.max()) if reward_count else 0.0,
-                    reward_count,
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "critic/rewards/min": reduce_extreme(
-                    float(reward_flat.min()) if reward_count else 0.0,
-                    reward_count,
-                    state,
-                    device,
-                    op=dist.ReduceOp.MIN,
-                ),
-                "critic/advantages/mean": reduce_weighted_mean(
-                    float(advantage_flat.sum()) if advantage_count else 0.0,
-                    advantage_count,
-                    state,
-                    device,
-                ),
-                "critic/advantages/max": reduce_extreme(
-                    float(advantage_flat.max()) if advantage_count else 0.0,
-                    advantage_count,
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "critic/advantages/min": reduce_extreme(
-                    float(advantage_flat.min()) if advantage_count else 0.0,
-                    advantage_count,
-                    state,
-                    device,
-                    op=dist.ReduceOp.MIN,
-                ),
-                "critic/returns/mean": reduce_weighted_mean(
-                    float(advantage_flat.sum()) if advantage_count else 0.0,
-                    advantage_count,
-                    state,
-                    device,
-                ),
-                "critic/returns/max": reduce_extreme(
-                    float(advantage_flat.max()) if advantage_count else 0.0,
-                    advantage_count,
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "critic/returns/min": reduce_extreme(
-                    float(advantage_flat.min()) if advantage_count else 0.0,
-                    advantage_count,
-                    state,
-                    device,
-                    op=dist.ReduceOp.MIN,
-                ),
-                "critic/rewards/std_mean": reduce_weighted_mean(
-                    float(per_prompt_std.sum()) if prompt_count else 0.0,
-                    prompt_count,
-                    state,
-                    device,
-                ),
-                "critic/rewards/zero_std_ratio": reduce_weighted_mean(
-                    float(np.sum(per_prompt_std == 0)) if prompt_count else 0.0,
-                    prompt_count,
-                    state,
-                    device,
-                ),
-                "critic/rewards/group_size": float(args.rollout_n),
-                "critic/score/mean": reduce_weighted_mean(
-                    float(reward_flat.sum()) if reward_count else 0.0,
-                    reward_count,
-                    state,
-                    device,
-                ),
-                "perf/mfu/actor_infer": 0.0,
-                "perf/mfu/actor": 0.0,
-                "perf/total_num_images": global_images,
-                "perf/time_per_step": global_step_time,
-                "perf/throughput": float(global_images / global_step_time),
-                "timing_s/start_profile": 0.0,
-                "timing_s/gen": gen_time,
-                "timing_s/reward": reward_time,
-                "timing_s/gen_reward": reduce_float(float(rollout_time), state, device, op=dist.ReduceOp.MAX),
-                "timing_s/old_log_prob": 0.0,
-                "timing_s/adv": adv_time_global,
-                "timing_s/update_actor": update_actor_time_global,
-                "timing_s/update_weights": update_weights_time_global,
-                "timing_s/step": global_step_time,
-                "timing_s/stop_profile": 0.0,
-                "timing_s/agent_loop/generate_sequences/min": reduce_extreme(
-                    min(gen_times) if gen_times else 0.0,
-                    len(gen_times),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MIN,
-                ),
-                "timing_s/agent_loop/generate_sequences/max": reduce_extreme(
-                    max(gen_times) if gen_times else 0.0,
-                    len(gen_times),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "timing_s/agent_loop/generate_sequences/mean": reduce_weighted_mean(
-                    float(sum(gen_times)),
-                    len(gen_times),
-                    state,
-                    device,
-                ),
-                "timing_s/agent_loop/compute_score/min": reduce_extreme(
-                    min(reward_times) if reward_times else 0.0,
-                    len(reward_times),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MIN,
-                ),
-                "timing_s/agent_loop/compute_score/max": reduce_extreme(
-                    max(reward_times) if reward_times else 0.0,
-                    len(reward_times),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "timing_s/agent_loop/compute_score/mean": reduce_weighted_mean(
-                    float(sum(reward_times)),
-                    len(reward_times),
-                    state,
-                    device,
-                ),
-                "timing_s/agent_loop/tool_calls/min": 0.0,
-                "timing_s/agent_loop/tool_calls/max": 0.0,
-                "timing_s/agent_loop/tool_calls/mean": 0.0,
-                "timing_s/agent_loop/num_preempted/min": -1,
-                "timing_s/agent_loop/num_preempted/max": -1,
-                "timing_s/agent_loop/num_preempted/mean": -1.0,
-                "timing_s/agent_loop/slowest/generate_sequences": reduce_extreme(
-                    max(gen_times) if gen_times else 0.0,
-                    len(gen_times),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "timing_s/agent_loop/slowest/compute_score": reduce_extreme(
-                    max(reward_times) if reward_times else 0.0,
-                    len(reward_times),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "timing_s/agent_loop/slowest/tool_calls": 0.0,
-                "timing_s/agent_loop/slowest/num_preempted": -1,
-                "timing_s/agent_loop/slowest/prompt_length": reduce_extreme(
-                    max(prompt_lengths) if prompt_lengths else 0.0,
-                    len(prompt_lengths),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-                "timing_s/agent_loop/slowest/response_length": reduce_extreme(
-                    max(response_lengths) if response_lengths else 0.0,
-                    len(response_lengths),
-                    state,
-                    device,
-                    op=dist.ReduceOp.MAX,
-                ),
-            }
-            metrics.update(
-                {
-                    "timing_per_image_ms/gen": float(gen_time * 1000 / global_images),
-                    "timing_per_image_ms/reward": float(reward_time * 1000 / global_images),
-                    "timing_per_image_ms/old_log_prob": 0.0,
-                    "timing_per_image_ms/adv": float(adv_time_global * 1000 / global_images),
-                    "timing_per_image_ms/update_actor": float(update_actor_time_global * 1000 / global_images),
-                }
+            weight_stats = update_weights(params=params, optimizer=optimizer, args=args)
+            metrics = compute_training_metrics(
+                step=step,
+                global_offset=global_offset,
+                train_rows=train_rows,
+                rollout_batch=rollout_batch,
+                actor_stats=actor_stats,
+                weight_stats=weight_stats,
+                optimizer=optimizer,
+                args=args,
+                state=state,
+                device=device,
+                step_time=time.perf_counter() - step_start,
             )
-
-            if run is not None:
-                run.log(metrics, step=step)
-            if is_main_process(state) and step % args.log_every == 0:
-                print("step:" + str(step) + " - " + " - ".join(f"{k}:{v}" for k, v in metrics.items()))
+            log_training_step(run, metrics, step, args, state)
 
         model.language_model = base_language_model(model)
         if is_main_process(state):
-            adapter_dir = output_dir / "adapter"
-            model.language_model.save_pretrained(adapter_dir)
-            print(f"saved adapter: {adapter_dir}")
-
-            if args.eval_at_end:
-                eval_metrics = evaluate(model, processor, val_rows, args, device, output_dir, step=args.total_training_steps)
-                print("final_eval:" + json.dumps(eval_metrics, ensure_ascii=False))
-                if run is not None:
-                    run.log(eval_metrics, step=args.total_training_steps)
-                    log_eval_generations_to_wandb(
-                        run,
-                        output_dir,
-                        step=args.total_training_steps,
-                        limit=args.log_val_generations,
-                    )
+            save_adapter_and_evaluate(model, processor, val_rows, args, device, output_dir, run)
 
         if state.enabled:
             distributed_barrier(state)

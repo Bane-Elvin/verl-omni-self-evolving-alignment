@@ -79,6 +79,7 @@ LAUNCHER=${LAUNCHER:-ray}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-${LOGPROB_MICRO_BATCH_SIZE:-1}}
 ROLLOUT_N=${ROLLOUT_N:-2}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-2}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
@@ -99,7 +100,6 @@ CFG_WEIGHT=${CFG_WEIGHT:-5.0}
 TEMPERATURE=${TEMPERATURE:-1.0}
 MAX_IMAGE_TOKENS=${MAX_IMAGE_TOKENS:-576}
 TOKEN_CHUNK_SIZE=${TOKEN_CHUNK_SIZE:-64}
-LOGPROB_MICRO_BATCH_SIZE=${LOGPROB_MICRO_BATCH_SIZE:-4}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
@@ -209,6 +209,8 @@ args=(
     --val-file "$ocr_test_path"
     --output-dir "$OUTPUT_DIR"
     --train-batch-size "$TRAIN_BATCH_SIZE"
+    --ppo-mini-batch-size "$PPO_MINI_BATCH_SIZE"
+    --ppo-micro-batch-size-per-gpu "$PPO_MICRO_BATCH_SIZE_PER_GPU"
     --rollout-n "$ROLLOUT_N"
     --total-training-steps "$TOTAL_TRAINING_STEPS"
     --ppo-epochs "$PPO_EPOCHS"
@@ -236,7 +238,7 @@ args=(
     --temperature "$TEMPERATURE"
     --max-image-tokens "$MAX_IMAGE_TOKENS"
     --token-chunk-size "$TOKEN_CHUNK_SIZE"
-    --logprob-micro-batch-size "$LOGPROB_MICRO_BATCH_SIZE"
+    --log-prob-micro-batch-size-per-gpu "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
     --eval-samples "$EVAL_SAMPLES"
     --eval-rollout-n "$EVAL_ROLLOUT_N"
     --log-val-generations "$LOG_VAL_GENERATIONS"

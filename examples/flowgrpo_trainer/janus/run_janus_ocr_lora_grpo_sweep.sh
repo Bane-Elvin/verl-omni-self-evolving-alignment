@@ -21,6 +21,9 @@ MODEL_PATH=${MODEL_PATH:-/home/Models/Janus-Pro-1B}
 REWARD_MODEL=${REWARD_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
 LAUNCHER=${LAUNCHER:-ray}
 TRAIN_GPU_POOL=${TRAIN_GPU_POOL:-0,1,2,3}
+TRAIN_NUM_GPUS=${TRAIN_NUM_GPUS:-4}
+PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-${LOGPROB_MICRO_BATCH_SIZE:-1}}
 AUTO_START_REWARD_SERVER=${AUTO_START_REWARD_SERVER:-0}
 REWARD_SERVER_HOST=${REWARD_SERVER_HOST:-127.0.0.1}
 REWARD_SERVER_PORT=${REWARD_SERVER_PORT:-8000}
@@ -101,7 +104,8 @@ while read -r train_bsz rollout_n steps; do
         continue
     fi
     run_name="${SWEEP_TAG}_b${train_bsz}_n${rollout_n}_s${steps}"
-    train_gpus=$(select_gpus "$train_bsz" "$TRAIN_GPU_POOL")
+    # Match BAGEL semantics: train_bsz is the global prompt batch, not the GPU count.
+    train_gpus=$(select_gpus "$TRAIN_NUM_GPUS" "$TRAIN_GPU_POOL")
     echo "==== ${run_name} ===="
 
     CUDA_VISIBLE_DEVICES="$train_gpus" \
@@ -109,11 +113,13 @@ while read -r train_bsz rollout_n steps; do
     WANDB_GROUP="$SWEEP_TAG" \
     WANDB_RUN_NAME="$run_name" \
     MODEL_PATH="$MODEL_PATH" \
-    NUM_GPUS_ACTOR_ROLLOUT_REWARD="$train_bsz" \
+    NUM_GPUS_ACTOR_ROLLOUT_REWARD="$TRAIN_NUM_GPUS" \
     LAUNCHER="$LAUNCHER" \
     TRAIN_BATCH_SIZE="$train_bsz" \
+    PPO_MINI_BATCH_SIZE="$train_bsz" \
+    PPO_MICRO_BATCH_SIZE_PER_GPU="$PPO_MICRO_BATCH_SIZE_PER_GPU" \
+    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" \
     ROLLOUT_N="$rollout_n" \
-    LOGPROB_MICRO_BATCH_SIZE="${LOGPROB_MICRO_BATCH_SIZE:-4}" \
     TOTAL_TRAINING_STEPS="$steps" \
     SAVE_FREQ="$steps" \
     TEST_FREQ="$steps" \
