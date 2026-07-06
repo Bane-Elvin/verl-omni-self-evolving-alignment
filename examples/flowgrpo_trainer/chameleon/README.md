@@ -1,25 +1,46 @@
 # Chameleon OCR GRPO
 
-This directory is a preflight placeholder for Chameleon-family OCR image-generation
-RL. The local `/home/elvin/Models/chameleon-7b` checkpoint cannot be used for the
-same OCR loop as BAGEL or Janus because it does not expose image output decoding.
+This directory contains a standalone AR-GRPO OCR runner for Chameleon-family
+image-token generation. The default checkpoint is Anole 7B because the public
+`facebook/chameleon-7b` Transformers path masks image-token logits and does not
+ship an image decoder.
 
-Observed blockers:
+Expected local paths:
 
-- The local model card declares `pipeline_tag: image-text-to-text`.
-- `ChameleonForConditionalGeneration.forward()` masks image-token logits.
-- `ChameleonVQVAE` in Transformers has no `decode` or `decode_code` method.
-- The local safetensors index has VQ encoder and quantizer weights, but no
-  decoder image weights.
+```bash
+/home/elvin/Models/Anole-7b-v0.1-hf
+/home/elvin/Models/Anole-7b-v0.1-vqvae-hf
+```
 
-Run the preflight check:
+Single run:
 
 ```bash
 cd /home/elvin/Projects/verl-omni-self-evolving-alignment
-MODEL_PATH=/home/elvin/Models/chameleon-7b \
+
+WANDB_PROJECT=verl-chameleon \
+MODEL_PATH=/home/elvin/Models/Anole-7b-v0.1-hf \
+VQVAE_PATH=/home/elvin/Models/Anole-7b-v0.1-vqvae-hf \
+TRAIN_BATCH_SIZE=4 \
+PPO_MINI_BATCH_SIZE=4 \
+ROLLOUT_N=4 \
+TOTAL_TRAINING_STEPS=43 \
+NUM_GPUS_ACTOR_ROLLOUT_REWARD=4 \
 bash examples/flowgrpo_trainer/chameleon/run_chameleon_ocr_lora_grpo.sh
 ```
 
-To train OCR with this folder, first provide a Chameleon-family checkpoint that
-can generate image tokens and decode those tokens into images. Then this folder
-can be extended with an AR-GRPO runner following the Janus implementation.
+Sweep matching the BAGEL/Janus sample-count settings:
+
+```bash
+cd /home/elvin/Projects/verl-omni-self-evolving-alignment
+
+WANDB_PROJECT=verl-chameleon \
+MODEL_PATH=/home/elvin/Models/Anole-7b-v0.1-hf \
+VQVAE_PATH=/home/elvin/Models/Anole-7b-v0.1-vqvae-hf \
+TRAIN_NUM_GPUS=4 \
+TRAIN_GPU_POOL=0,1,2,3 \
+SWEEP_SPECS=$'1 16 172\n1 8 172\n1 4 172\n2 8 86\n2 4 86\n4 4 43' \
+bash examples/flowgrpo_trainer/chameleon/run_chameleon_ocr_lora_grpo_sweep.sh
+```
+
+The runner logs metrics under the same high-level groups as the Janus runner:
+`actor/*`, `critic/*`, `perf/*`, `timing_s/*`, and `timing_per_image_ms/*`.
