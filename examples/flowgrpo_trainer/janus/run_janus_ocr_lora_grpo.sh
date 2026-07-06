@@ -108,6 +108,7 @@ LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
 PPO_EPOCHS=${PPO_EPOCHS:-1}
+POLICY_LOSS=${POLICY_LOSS:-stage_grpo}
 EVAL_AT_END=${EVAL_AT_END:-1}
 EVAL_SAMPLES=${EVAL_SAMPLES:-$VAL_BATCH_SIZE}
 EVAL_ROLLOUT_N=${EVAL_ROLLOUT_N:-1}
@@ -215,6 +216,7 @@ args=(
     --total-training-steps "$TOTAL_TRAINING_STEPS"
     --ppo-epochs "$PPO_EPOCHS"
     --clip-ratio "${CLIP_RATIO:-0.2}"
+    --policy-loss "$POLICY_LOSS"
     --learning-rate "$LEARNING_RATE"
     --weight-decay "$WEIGHT_DECAY"
     --max-grad-norm "$MAX_GRAD_NORM"

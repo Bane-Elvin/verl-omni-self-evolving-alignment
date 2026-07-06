@@ -79,7 +79,7 @@ class ActorUpdateStats:
     clipfrac_sum: float
     clipfrac_higher_sum: float
     clipfrac_lower_sum: float
-    token_count: int
+    loss_count: int
     update_actor_time: float
 
 
@@ -404,6 +404,39 @@ def guided_logprobs(
     return torch.cat(logprob_chunks, dim=1)
 
 
+def policy_loss_and_stats(
+    new_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    policy_loss: str,
+    clip_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Compute the AR image-token policy loss for one prompt shard."""
+    if policy_loss == "stage_grpo":
+        sequence_logprobs = new_logprobs.mean(dim=1)
+        ratio = torch.exp(sequence_logprobs - sequence_logprobs.detach())
+        raw_loss = -(ratio * advantages).mean()
+        return raw_loss, ratio.detach().float(), int(advantages.numel())
+
+    sequence_log_ratio = (new_logprobs - old_logprobs).mean(dim=1)
+    if policy_loss == "sequence_grpo":
+        ratio = torch.exp(sequence_log_ratio)
+        unclipped = ratio * advantages
+        clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
+        raw_loss = -torch.min(unclipped, clipped).mean()
+        return raw_loss, ratio.detach().float(), int(advantages.numel())
+
+    if policy_loss == "token_ppo":
+        ratio = torch.exp(new_logprobs - old_logprobs)
+        adv_tokens = advantages[:, None].expand_as(ratio)
+        unclipped = ratio * adv_tokens
+        clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv_tokens
+        raw_loss = -torch.min(unclipped, clipped).mean()
+        return raw_loss, ratio.detach().float(), int(new_logprobs.numel())
+
+    raise ValueError(f"Unsupported policy_loss={policy_loss!r}")
+
+
 def pil_to_data_url(image: Image.Image) -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
@@ -646,6 +679,7 @@ def wandb_config(args) -> dict:
         },
         "actor": {
             "optim": {"lr": args.learning_rate, "weight_decay": args.weight_decay},
+            "policy_loss": args.policy_loss,
             "ppo_mini_batch_size": args.ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": args.ppo_micro_batch_size_per_gpu,
         },
@@ -731,6 +765,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-training-steps", type=int, default=1)
     parser.add_argument("--ppo-epochs", type=int, default=1)
     parser.add_argument("--clip-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--policy-loss",
+        choices=["stage_grpo", "sequence_grpo", "token_ppo"],
+        default="stage_grpo",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -970,7 +1009,10 @@ def update_actor(
                 if args.ppo_micro_batch_size_per_gpu <= 0
                 else min(args.ppo_micro_batch_size_per_gpu, tokens.shape[0])
             )
-            total_token_count = max(1, int(tokens.numel()))
+            total_loss_count = max(
+                1,
+                int(tokens.numel() if args.policy_loss == "token_ppo" else tokens.shape[0]),
+            )
             for micro_start in range(0, tokens.shape[0], micro_batch_size):
                 micro_end = min(tokens.shape[0], micro_start + micro_batch_size)
                 micro_tokens = tokens[micro_start:micro_end].contiguous()
@@ -986,24 +1028,24 @@ def update_actor(
                     token_chunk_size=args.token_chunk_size,
                     device=device,
                 )
-                ratio = torch.exp(new_logprobs - micro_old_logprobs)
-                ratio_float = ratio.detach().float()
-                adv_tokens = micro_adv[:, None].expand_as(ratio)
-                unclipped = ratio * adv_tokens
-                clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * adv_tokens
-                raw_loss = -torch.min(unclipped, clipped).mean()
-                micro_token_count = int(micro_tokens.numel())
-                loss_scale = micro_token_count / total_token_count
+                raw_loss, ratio_float, micro_loss_count = policy_loss_and_stats(
+                    new_logprobs=new_logprobs,
+                    old_logprobs=micro_old_logprobs,
+                    advantages=micro_adv,
+                    policy_loss=args.policy_loss,
+                    clip_ratio=args.clip_ratio,
+                )
+                loss_scale = micro_loss_count / total_loss_count
                 loss = raw_loss * loss_scale / args.train_batch_size / args.ppo_epochs
                 loss.backward()
 
-                actor_losses.append(raw_loss.detach().float() * micro_token_count)
-                actor_loss_count += micro_token_count
-                ratio_values.append(ratio_float.mean() * micro_token_count)
-                ratio_std_values.append(ratio_float.std(unbiased=False) * micro_token_count)
-                clip_values.append((torch.abs(ratio_float - 1.0) > args.clip_ratio).float().mean() * micro_token_count)
-                clip_high_values.append((ratio_float > 1.0 + args.clip_ratio).float().mean() * micro_token_count)
-                clip_low_values.append((ratio_float < 1.0 - args.clip_ratio).float().mean() * micro_token_count)
+                actor_losses.append(raw_loss.detach().float() * micro_loss_count)
+                actor_loss_count += micro_loss_count
+                ratio_values.append(ratio_float.mean() * micro_loss_count)
+                ratio_std_values.append(ratio_float.std(unbiased=False) * micro_loss_count)
+                clip_values.append((torch.abs(ratio_float - 1.0) > args.clip_ratio).float().mean() * micro_loss_count)
+                clip_high_values.append((ratio_float > 1.0 + args.clip_ratio).float().mean() * micro_loss_count)
+                clip_low_values.append((ratio_float < 1.0 - args.clip_ratio).float().mean() * micro_loss_count)
 
     return ActorUpdateStats(
         loss_sum=float(torch.stack(actor_losses).sum().item()) if actor_losses else 0.0,
@@ -1012,7 +1054,7 @@ def update_actor(
         clipfrac_sum=float(torch.stack(clip_values).sum().item()) if clip_values else 0.0,
         clipfrac_higher_sum=float(torch.stack(clip_high_values).sum().item()) if clip_high_values else 0.0,
         clipfrac_lower_sum=float(torch.stack(clip_low_values).sum().item()) if clip_low_values else 0.0,
-        token_count=actor_loss_count,
+        loss_count=actor_loss_count,
         update_actor_time=time.perf_counter() - update_start,
     )
 
@@ -1054,7 +1096,7 @@ def compute_training_metrics(
     global_step_time = reduce_float(float(step_time), state, device, op=dist.ReduceOp.MAX)
     global_images = int(args.train_batch_size * args.rollout_n)
     n_gpus = state.world_size if state.enabled else 1
-    actor_count = actor_stats.token_count
+    actor_count = actor_stats.loss_count
     reward_count = int(reward_flat.size)
     prompt_count = len(rollout_batch.rows)
     advantage_count = int(advantage_flat.size)
