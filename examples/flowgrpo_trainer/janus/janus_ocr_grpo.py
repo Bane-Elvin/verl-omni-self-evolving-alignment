@@ -747,10 +747,10 @@ def init_wandb(args, output_dir: Path):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Janus-Pro on OCR prompts with AR-GRPO.")
     parser.add_argument("--janus-code-path", default="/home/elvin/Projects/Bagel-test/.cache/janus_official")
-    parser.add_argument("--model-path", default="/home/Models/Janus-Pro-1B")
+    parser.add_argument("--model-path", default="/home/elvin/Models/Janus-Pro-7B")
     parser.add_argument("--train-file", default="/home/elvin/Datasets/data/ocr/bagel/train.parquet")
     parser.add_argument("--val-file", default="/home/elvin/Datasets/data/ocr/bagel/test.parquet")
-    parser.add_argument("--output-dir", default="outputs/janus_ocr_grpo")
+    parser.add_argument("--output-dir", default="outputs/janus_pro_7b_ocr_grpo")
     parser.add_argument("--adapter-path", default="")
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--launcher", choices=["local", "ray"], default="local")

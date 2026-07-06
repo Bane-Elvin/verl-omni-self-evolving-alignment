@@ -62,12 +62,20 @@ ocr_train_path=${TRAIN_FILE:-$WORKSPACE/data/ocr/bagel/train.parquet}
 ocr_test_path=${VAL_FILE:-$WORKSPACE/data/ocr/bagel/test.parquet}
 
 JANUS_CODE_PATH=${JANUS_CODE_PATH:-/home/elvin/Projects/Bagel-test/.cache/janus_official}
+JANUS_MODEL_SIZE=${JANUS_MODEL_SIZE:-7B}
+JANUS_MODEL_NAME=${JANUS_MODEL_NAME:-Janus-Pro-$JANUS_MODEL_SIZE}
+janus_model_size_slug=${JANUS_MODEL_SIZE,,}
 if [[ -z "${MODEL_PATH:-}" ]]; then
-    if [[ -d "/home/Models/Janus-Pro-1B" ]]; then
-        model_name=/home/Models/Janus-Pro-1B
-    else
-        model_name=$HOME/models/deepseek-ai/Janus-Pro-1B
-    fi
+    model_name=
+    for candidate in \
+        "$HOME/Models/$JANUS_MODEL_NAME" \
+        "/home/Models/$JANUS_MODEL_NAME" \
+        "$HOME/models/deepseek-ai/$JANUS_MODEL_NAME"; do
+        if [[ -d "$candidate" ]]; then
+            model_name=$candidate
+            break
+        fi
+    done
 else
     model_name=$MODEL_PATH
 fi
@@ -88,7 +96,7 @@ SAVE_FREQ=${SAVE_FREQ:-$TOTAL_TRAINING_STEPS}
 TEST_FREQ=${TEST_FREQ:-$TOTAL_TRAINING_STEPS}
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-2}
 WANDB_PROJECT=${WANDB_PROJECT:-verl-janus}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-janus_ocr_lora}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-janus_pro_${janus_model_size_slug}_ocr_lora}
 WANDB_GROUP=${WANDB_GROUP:-}
 WANDB_MODE=${WANDB_MODE:-online}
 TRAINER_LOGGER=${TRAINER_LOGGER:-'["console","wandb"]'}
@@ -116,7 +124,7 @@ SAVE_EVAL_IMAGES=${SAVE_EVAL_IMAGES:-1}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-8}
 ADAPTER_PATH=${ADAPTER_PATH:-}
 EVAL_ONLY=${EVAL_ONLY:-0}
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/janus_ocr_grpo}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/janus_pro_${janus_model_size_slug}_ocr_grpo}
 OUTPUT_DIR=$(abs_path "$OUTPUT_DIR")
 if [[ -n "$ADAPTER_PATH" ]]; then
     ADAPTER_PATH=$(abs_path "$ADAPTER_PATH")
@@ -136,7 +144,7 @@ if [[ ! -d "$JANUS_CODE_PATH/janus" ]]; then
 fi
 if [[ ! -d "$model_name" ]]; then
     echo "Missing Janus model directory: $model_name" >&2
-    echo "Set MODEL_PATH to the local Janus-Pro-1B directory." >&2
+    echo "Set MODEL_PATH to the local $JANUS_MODEL_NAME directory." >&2
     exit 1
 fi
 if [[ ! -f "$ocr_train_path" ]]; then

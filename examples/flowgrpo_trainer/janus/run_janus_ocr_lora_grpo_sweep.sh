@@ -15,9 +15,23 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
     fi
 fi
 
-SWEEP_TAG=${SWEEP_TAG:-janus_ocr_seen172_$(date +%m%d_%H%M)}
+JANUS_MODEL_SIZE=${JANUS_MODEL_SIZE:-7B}
+JANUS_MODEL_NAME=${JANUS_MODEL_NAME:-Janus-Pro-$JANUS_MODEL_SIZE}
+janus_model_size_slug=${JANUS_MODEL_SIZE,,}
+SWEEP_TAG=${SWEEP_TAG:-janus_pro_${janus_model_size_slug}_ocr_seen172_$(date +%m%d_%H%M)}
 WANDB_PROJECT=${WANDB_PROJECT:-verl-janus}
-MODEL_PATH=${MODEL_PATH:-/home/Models/Janus-Pro-1B}
+if [[ -z "${MODEL_PATH:-}" ]]; then
+    MODEL_PATH=
+    for candidate in \
+        "$HOME/Models/$JANUS_MODEL_NAME" \
+        "/home/Models/$JANUS_MODEL_NAME" \
+        "$HOME/models/deepseek-ai/$JANUS_MODEL_NAME"; do
+        if [[ -d "$candidate" ]]; then
+            MODEL_PATH=$candidate
+            break
+        fi
+    done
+fi
 REWARD_MODEL=${REWARD_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
 LAUNCHER=${LAUNCHER:-ray}
 TRAIN_GPU_POOL=${TRAIN_GPU_POOL:-0,1,2,3}
