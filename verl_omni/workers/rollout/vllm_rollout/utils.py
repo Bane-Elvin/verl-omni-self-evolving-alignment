@@ -63,6 +63,13 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             return model, model_config
         return None
 
+    def _get_pipeline_lora_loader(self):
+        model_runner = getattr(self, "model_runner", None)
+        pipeline = getattr(model_runner, "pipeline", None)
+        if pipeline is not None and hasattr(pipeline, "load_lora_weights"):
+            return pipeline.load_lora_weights
+        return None
+
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model.
 
@@ -82,6 +89,13 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         )
 
         if peft_config and base_sync_done:
+            pipeline_lora_loader = self._get_pipeline_lora_loader()
+            if pipeline_lora_loader is not None:
+                accumulated_weights: dict[str, torch.Tensor] = {}
+                receiver.receive_weights(on_bucket_received=lambda weights: accumulated_weights.update(weights))
+                pipeline_lora_loader(accumulated_weights, peft_config)
+                return
+
             # In async mode, make sure the old lora is removed before adding the new one
             t0 = time.perf_counter()
             self.remove_lora(VLLM_LORA_INT_ID)

@@ -239,6 +239,31 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 type(module).__name__,
             )
 
+        if hasattr(module, "config") and not hasattr(module.config, "save_pretrained"):
+
+            def save_config(self, save_directory: str | os.PathLike):
+                def to_jsonable(value):
+                    if hasattr(value, "to_dict") and not isinstance(value, dict):
+                        value = value.to_dict()
+                    if hasattr(value, "items"):
+                        return {str(k): to_jsonable(v) for k, v in value.items()}
+                    if isinstance(value, (list, tuple)):
+                        return [to_jsonable(v) for v in value]
+                    if isinstance(value, set):
+                        return sorted(to_jsonable(v) for v in value)
+                    try:
+                        json.dumps(value)
+                    except TypeError:
+                        return str(value)
+                    return value
+
+                config = to_jsonable(self)
+                output_config_file = os.path.join(save_directory, "config.json")
+                with open(output_config_file, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4, sort_keys=True)
+
+            module.config.save_pretrained = save_config.__get__(module.config)
+
         module.can_generate = lambda: False
         return module
 
