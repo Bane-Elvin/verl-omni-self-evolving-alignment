@@ -36,6 +36,7 @@ from transformers.configuration_utils import PretrainedConfig
 DEFAULT_GRM_PROMPT = (
     "Please output only the text content from the image without any additional descriptions or formatting."
 )
+DEFAULT_SAMPLING_PARAMS = {"temperature": 0.7, "top_p": 0.8, "max_tokens": 4096}
 
 
 @dataclass
@@ -449,8 +450,7 @@ def score_images_openai_ocr(
                     ],
                 },
             ],
-            "temperature": 0.0,
-            "max_tokens": 512,
+            **DEFAULT_SAMPLING_PARAMS,
         }
         resp = requests.post(reward_url, json=payload, timeout=timeout)
         resp.raise_for_status()
